@@ -4,9 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/klauspost/compress/flate"
+	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/snappy"
+	"github.com/markusthoemmes/goautoneg"
 
 	"github.com/quay/claircore"
 	je "github.com/quay/claircore/pkg/jsonerr"
@@ -23,6 +30,91 @@ const (
 type HTTP struct {
 	*http.ServeMux
 	serv Service
+}
+
+var (
+	snappyPool = sync.Pool{
+		New: func() interface{} {
+			return snappy.NewBufferedWriter(nil)
+		},
+	}
+	gzipPool = sync.Pool{
+		New: func() interface{} {
+			w, _ := gzip.NewWriterLevel(nil, gzip.BestSpeed)
+			return w
+		},
+	}
+	flatePool = sync.Pool{
+		New: func() interface{} {
+			w, _ := flate.NewWriter(nil, flate.BestSpeed)
+			return w
+		},
+	}
+)
+
+// Enc picks a suitable content encoding, sets the correct header, and returns
+// an io.WriteCloser configured to write the chosen format to the
+// http.ResponseWriter.
+//
+// The caller must call Close to ensure all data is flushed.
+func enc(w http.ResponseWriter, r *http.Request) io.WriteCloser {
+	as := goautoneg.ParseAccept(r.Header.Get("accept-encoding"))
+Pick:
+	for _, a := range as {
+		switch a.Type {
+		case "gzip":
+			w.Header().Set("content-encoding", "gzip")
+			wc := gzipPool.Get().(*gzip.Writer)
+			wc.Reset(w)
+			return &poolCloser{
+				pool:        &gzipPool,
+				WriteCloser: wc,
+			}
+		case "deflate":
+			w.Header().Set("content-encoding", "deflate")
+			wc := flatePool.Get().(*flate.Writer)
+			wc.Reset(w)
+			return &poolCloser{
+				pool:        &flatePool,
+				WriteCloser: wc,
+			}
+		case "identity":
+			w.Header().Set("content-encoding", "identity")
+			fallthrough
+		case "*":
+			break Pick
+		case "snappy": // Nonstandard
+			w.Header().Set("content-encoding", "snappy")
+			wc := snappyPool.Get().(*snappy.Writer)
+			wc.Reset(w)
+			return &poolCloser{
+				pool:        &snappyPool,
+				WriteCloser: wc,
+			}
+		}
+	}
+	return nopcloser{w}
+}
+
+// Nopcloser allows an io.Writer to satisfy io.WriteCloser.
+type nopcloser struct {
+	io.Writer
+}
+
+func (nopcloser) Close() error { return nil }
+
+// PoolCloser returns a WriteCloser to the pool after a successful Close call.
+type poolCloser struct {
+	pool *sync.Pool
+	io.WriteCloser
+}
+
+func (p *poolCloser) Close() error {
+	if err := p.WriteCloser.Close(); err != nil {
+		return err
+	}
+	p.pool.Put(p.WriteCloser)
+	return nil
 }
 
 func NewHTTPTransport(service Service) (*HTTP, error) {
@@ -73,7 +165,9 @@ func (h *HTTP) IndexReportHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = json.NewEncoder(w).Encode(report)
+	out := enc(w, r)
+	defer out.Close()
+	err = json.NewEncoder(out).Encode(report)
 	if err != nil {
 		resp := &je.Response{
 			Code:    "encoding-error",
@@ -116,8 +210,10 @@ func (h *HTTP) IndexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	out := enc(w, r)
+	defer out.Close()
 	w.WriteHeader(http.StatusCreated)
-	err = json.NewEncoder(w).Encode(report)
+	err = json.NewEncoder(out).Encode(report)
 	if err != nil {
 		resp := &je.Response{
 			Code:    "encoding-error",
